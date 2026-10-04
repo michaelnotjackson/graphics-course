@@ -1,6 +1,6 @@
 # Локальный Shadertoy 2
 
-**Зависимости: [shadertoy2](/tasks/shadertoy3/), [local_shadertoy1](/tasks/local_shadertoy1/)**.
+**Зависимости: [shadertoy3](/tasks/shadertoy3/), [local_shadertoy1](/tasks/local_shadertoy1/)**.
 
 В данном задании на предстоит наконец-то познакомиться с тем, как запускать традиционный графический пайплайн на Вулкане.
 
