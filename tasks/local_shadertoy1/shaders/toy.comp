@@ -5,10 +5,16 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0, rgba8)
 uniform writeonly image2D outputImage;
 
-#define iResolution vec3(vec2(imageSize(outputImage)), 1.0)
+layout(push_constant, std430) uniform ToyConstants
+{
+  vec4 resolutionTime;
 
-const float iTime = 0.0;
-const vec4 iMouse = vec4(0.0);
+  vec4 mouse;
+} pc;
+
+#define iResolution (pc.resolutionTime.xyz)
+#define iTime (pc.resolutionTime.w)
+#define iMouse (pc.mouse)
 
 #define MAX_STEPS 220
 #define MAX_DIST 100.0

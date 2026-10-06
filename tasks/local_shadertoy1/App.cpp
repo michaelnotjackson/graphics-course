@@ -2,6 +2,10 @@
 
 #include <cstdint>
 #include <vector>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
 
 #include <etna/DescriptorSet.hpp>
 #include <etna/Etna.hpp>
@@ -9,6 +13,34 @@
 #include <etna/PipelineManager.hpp>
 #include <etna/ShaderProgram.hpp>
 
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+namespace
+{
+
+bool compileToyShader()
+{
+  const std::filesystem::path sourcePath = LOCAL_SHADERTOY1_SOURCE_ROOT "toy.comp";
+  const std::filesystem::path outputPath = LOCAL_SHADERTOY1_SHADERS_ROOT "toy.comp.spv";
+  const std::filesystem::path temporaryPath = outputPath.string() + ".tmp";
+
+  const int result = std::system(
+    ("glslangValidator -V --target-env vulkan1.2 -S comp -o \"" +
+     temporaryPath.string() + "\" \"" + sourcePath.string() + "\"").c_str());
+
+  if (result != 0)
+    return false;
+
+  std::filesystem::copy_file(
+    temporaryPath, outputPath, std::filesystem::copy_options::overwrite_existing);
+
+  std::filesystem::remove(temporaryPath);
+
+  return true;
+}
+
+} // namespace
 
 App::App()
   : resolution{1280, 720}
@@ -84,7 +116,13 @@ App::App()
     resolution = {w, h};
   }
 
+  if (!compileToyShader())
+  {
+    throw std::runtime_error("Failed to compile toy.comp");
+  }
+
   etna::create_program("toy", {LOCAL_SHADERTOY1_SHADERS_ROOT "toy.comp.spv"});
+
 
   pipeline = etna::get_context().getPipelineManager().createComputePipeline(
     "toy", etna::ComputePipeline::CreateInfo{});
@@ -105,9 +143,14 @@ App::~App()
 
 void App::run()
 {
+  startTime = std::chrono::steady_clock::now();
+
+  glfwSetInputMode(osWindow->native(), GLFW_STICKY_KEYS, GLFW_TRUE);
+
   while (!osWindow->isBeingClosed())
   {
     windowing.poll();
+    updateInput();
 
     drawFrame();
   }
@@ -191,6 +234,13 @@ void App::drawFrame()
         {descriptorSet.getVkSet()},
         {});
 
+
+      currentCmdBuf.pushConstants(
+        program.getPipelineLayout(),
+        vk::ShaderStageFlagBits::eCompute,
+        0,
+        static_cast<uint32_t>(sizeof(ShaderConstants)),
+        &shaderConstants);
 
       currentCmdBuf.dispatch((resolution.x + 7u) / 8u, (resolution.y + 7u) / 8u, 1);
 
@@ -280,4 +330,65 @@ void App::drawFrame()
       });
     ETNA_VERIFY((resolution == glm::uvec2{w, h}));
   }
+}
+
+void App::updateInput()
+{
+  GLFWwindow* window = osWindow->native();
+
+  const bool reloadDown = glfwGetKey(window, GLFW_KEY_F5) == GLFW_PRESS;
+
+  if (reloadDown && !reloadWasDown)
+    reloadToyShader();
+
+  reloadWasDown = reloadDown;
+
+  const auto now = std::chrono::steady_clock::now();
+
+  shaderConstants.resolutionTime[0] = static_cast<float>(resolution.x);
+  shaderConstants.resolutionTime[1] = static_cast<float>(resolution.y);
+  shaderConstants.resolutionTime[2] = 1.0f;
+  shaderConstants.resolutionTime[3] = std::chrono::duration<float>(now - startTime).count();
+
+  int windowWidth = 0;
+  int windowHeight = 0;
+  glfwGetWindowSize(window, &windowWidth, &windowHeight);
+
+  shaderConstants.mouse[2] = 0.0f;
+  shaderConstants.mouse[3] = 0.0f;
+
+  if (windowWidth <= 0 || windowHeight <= 0)
+    return;
+
+  double mouseX = 0.0;
+  double mouseY = 0.0;
+  glfwGetCursorPos(window, &mouseX, &mouseY);
+
+  shaderConstants.mouse[0] =
+    static_cast<float>(mouseX * static_cast<double>(resolution.x) / windowWidth);
+
+  shaderConstants.mouse[1] = static_cast<float>(
+    (static_cast<double>(windowHeight) - mouseY) * static_cast<double>(resolution.y) /
+    windowHeight);
+
+  const bool focused = glfwGetWindowAttrib(window, GLFW_FOCUSED) == GLFW_TRUE;
+
+  const bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+  shaderConstants.mouse[2] = focused && mouseDown ? 1.0f : 0.0f;
+}
+
+void App::reloadToyShader()
+{
+  if (!compileToyShader())
+  {
+    std::cerr << "Shader compilation failed; keeping the old shader.\n";
+    return;
+  }
+
+  ETNA_CHECK_VK_RESULT(etna::get_context().getDevice().waitIdle());
+
+  etna::reload_shaders();
+
+  std::cout << "Shader reloaded.\n";
 }
