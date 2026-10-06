@@ -1,18 +1,306 @@
-#version 430
+#version 450
 
-layout(local_size_x = 32, local_size_y = 32) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(binding = 0, rgba8) uniform image2D resultImage;
+layout(set = 0, binding = 0, rgba8)
+uniform writeonly image2D outputImage;
 
+layout(push_constant, std430) uniform ToyConstants
+{
+  vec4 resolutionTime;
+
+  vec4 mouse;
+} pc;
+
+#define iResolution (pc.resolutionTime.xyz)
+#define iTime (pc.resolutionTime.w)
+#define iMouse (pc.mouse)
+
+#define MAX_STEPS 220
+#define MAX_DIST 100.0
+#define SURF_DIST 0.0015
+
+const float PI = 3.14159265;
+const float PERIOD = 1.85;
+const float RADIUS = 0.48;
+
+vec2 ballXZ(int id) {
+    float a = float(id) * 2.0 * PI / 3.0;
+    return 1.65 * vec2(cos(a), sin(a));
+}
+
+float ballPhase(int id) {
+    return float(id) * PERIOD / 3.0;
+}
+
+float cycleTime(int id) {
+    return mod(iTime + ballPhase(id), PERIOD);
+}
+
+vec3 ballPosition(int id) {
+    float t = cycleTime(id) / PERIOD;
+
+    float jump = 2.15 * 4.0 * t * (1.0 - t);
+    vec2 xz = ballXZ(id);
+
+    return vec3(xz.x, RADIUS + jump, xz.y);
+}
+
+vec3 ballColor(int id) {
+    if (id == 0) return vec3(0.0588, 1.0, 0.1843);
+    if (id == 1) return vec3(1.0, 0.16, 0.30);
+    return vec3(1.0, 0.67, 0.12);
+}
+
+float floorHeight(vec2 p) {
+    float h = 0.0;
+
+    for (int id = 0; id < 3; id++) {
+        float r = length(p - ballXZ(id));
+        float localTime = cycleTime(id);
+
+        for (int k = 0; k < 3; k++) {
+            float age = localTime + float(k) * PERIOD;
+            float wave = r - 2.65 * age;
+            float envelope = exp(-1.8 * wave * wave);
+            float fadeIn = smoothstep(0.0, 0.13, age);
+            float fadeOut = exp(-0.65 * age);
+            float originMask = smoothstep(0.25, 0.8, r);
+
+            h += 0.095 * sin(8.5 * wave)
+                * envelope * fadeIn * fadeOut * originMask;
+        }
+    }
+
+    return h;
+}
+
+vec2 scene(vec3 p) {
+    vec2 result = vec2(
+        (p.y - floorHeight(p.xz)) * 0.55,
+        0.0
+    );
+
+    for (int id = 0; id < 3; id++) {
+        float d = length(p - ballPosition(id)) - RADIUS;
+
+        if (d < result.x) {
+            result = vec2(d, float(id + 1));
+        }
+    }
+
+    return result;
+}
+
+vec3 surfaceNormal(vec3 p) {
+    const float e = 0.002;
+    vec2 k = vec2(1.0, -1.0);
+
+    return normalize(
+        k.xyy * scene(p + k.xyy * e).x
+        + k.yyx * scene(p + k.yyx * e).x
+        + k.yxy * scene(p + k.yxy * e).x
+        + k.xxx * scene(p + k.xxx * e).x
+    );
+}
+
+vec2 trace(vec3 ro, vec3 rd) {
+    float t = 0.0;
+
+    for (int i = 0; i < MAX_STEPS; i++) {
+        vec2 hit = scene(ro + rd * t);
+
+        if (hit.x < SURF_DIST) {
+            return vec2(t, hit.y);
+        }
+
+        t += hit.x * 0.85;
+
+        if (t > MAX_DIST) break;
+    }
+
+    return vec2(MAX_DIST, -1.0);
+}
+
+float softShadow(vec3 ro, vec3 rd, float maxT) {
+    float shade = 1.0;
+    float t = 0.04;
+
+    for (int i = 0; i < 40; i++) {
+        float h = scene(ro + rd * t).x;
+        shade = min(shade, 12.0 * h / t);
+        t += clamp(h, 0.025, 0.3);
+
+        if (h < 0.001 || t > maxT) break;
+    }
+
+    return clamp(shade, 0.0, 1.0);
+}
+
+vec3 environment(vec3 rd) {
+    float sky = smoothstep(-0.3, 0.85, rd.y);
+    vec3 col = mix(
+        vec3(0.025, 0.035, 0.065),
+        vec3(0.16, 0.23, 0.34),
+        sky
+    );
+
+    vec3 lightDir = normalize(vec3(-0.5, 0.9, -0.35));
+    float panel = pow(max(dot(rd, lightDir), 0.0), 30.0);
+    col += vec3(1.0, 0.88, 0.72) * panel * 1.8;
+
+    return col;
+}
+
+vec3 shade(vec3 p, vec3 rd, float material) {
+    vec3 n = surfaceNormal(p);
+    vec3 v = -rd;
+    vec3 lightPos = vec3(-3.5, 7.0, 4.0);
+    vec3 l = normalize(lightPos - p);
+    vec3 h = normalize(l + v);
+
+    float shadow = softShadow(
+        p + n * 0.015,
+        l,
+        length(lightPos - p)
+    );
+
+    float diffuse = max(dot(n, l), 0.0);
+    float specular = pow(max(dot(n, h), 0.0), 90.0);
+
+    vec3 base;
+    float reflection;
+
+    if (material < 0.5) {
+        base = vec3(0.035, 0.055, 0.075);
+        reflection = 0.22;
+
+        vec2 cell = abs(fract(p.xz * 0.5 + 0.5) - 0.5);
+        float line = 1.0 - smoothstep(
+            0.008,
+            0.025,
+            min(cell.x, cell.y)
+        );
+        base += vec3(0.025, 0.04, 0.05) * line;
+
+        float crest = abs(floorHeight(p.xz));
+
+        for (int id = 0; id < 3; id++) {
+            float r = length(p.xz - ballXZ(id));
+            vec3 tint = ballColor(id);
+            base += tint * 0.08 * exp(-0.7 * r * r);
+        }
+    } else {
+        int id = int(material - 1.0);
+        base = ballColor(id);
+        reflection = 0.3;
+
+        float flash = exp(-cycleTime(id) * 16.0);
+    }
+
+    vec3 ambient = vec3(0.13, 0.18, 0.26);
+    vec3 col = base * (
+        ambient + diffuse * shadow * vec3(1.2, 1.08, 0.95)
+    );
+
+    col += specular * shadow * vec3(1.5, 1.35, 1.15);
+    col += environment(reflect(rd, n)) * reflection;
+
+    if (material < 0.5) {
+        vec3 rr = reflect(rd, n);
+        vec3 origin = p + n * 0.02;
+        float nearest = MAX_DIST;
+        vec3 reflectedColor = vec3(0.0);
+
+        for (int id = 0; id < 3; id++) {
+            vec3 oc = origin - ballPosition(id);
+            float b = dot(oc, rr);
+            float c = dot(oc, oc) - RADIUS * RADIUS;
+            float discriminant = b * b - c;
+
+            if (discriminant > 0.0) {
+                float t = -b - sqrt(discriminant);
+
+                if (t > 0.0 && t < nearest) {
+                    nearest = t;
+                    vec3 q = origin + rr * t;
+                    vec3 sn = normalize(q - ballPosition(id));
+                    float lighting = max(dot(sn, l), 0.0);
+                    reflectedColor = ballColor(id)
+                        * (0.2 + 0.8 * lighting);
+                }
+            }
+        }
+
+        if (nearest < MAX_DIST) {
+            float strength = 0.42 * exp(-nearest * 0.12);
+            col = mix(col, reflectedColor, strength);
+        }
+    }
+
+    return col;
+}
+
+void mainImage(out vec4 fragColor, in vec2 fragCoord) {
+    vec2 uv = (2.0 * fragCoord - iResolution.xy)
+        / iResolution.y;
+
+    float angle = 0.35 + iTime * 0.10;
+    float elevation = 4.1;
+
+    if (iMouse.z > 0.0) {
+        angle = (iMouse.x / iResolution.x - 0.5) * 6.28;
+        elevation = 2.0 + 5.0 * iMouse.y / iResolution.y;
+    }
+
+    vec3 ro = vec3(
+        7.8 * sin(angle),
+        elevation,
+        7.8 * cos(angle)
+    );
+    vec3 target = vec3(0.0, 0.8, 0.0);
+
+    vec3 forward = normalize(target - ro);
+    vec3 right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)));
+    vec3 up = cross(right, forward);
+    vec3 rd = normalize(
+        right * uv.x + up * uv.y + forward * 1.65
+    );
+
+    vec2 hit = trace(ro, rd);
+    vec3 col = environment(rd);
+
+    if (hit.y >= 0.0) {
+        vec3 p = ro + rd * hit.x;
+        col = shade(p, rd, hit.y);
+
+        float fog = 1.0 - exp(-0.05 * hit.x);
+        col = mix(col, environment(rd), fog);
+    }
+
+    col *= 1.0 - 0.18 * smoothstep(0.3, 1.5, length(uv));
+    col = pow(max(col, 0.0), vec3(1.0 / 2.2));
+
+    fragColor = vec4(col, 1.0);
+}
 
 void main()
 {
-  ivec2 uv = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = imageSize(outputImage);
 
-  // TODO: Put your shadertoy code here!
-  // Simple gradient as a test.
-  vec3 color = vec3(vec2(uv) / vec2(1280, 720), 0);
+  if (any(greaterThanEqual(pixel, size)))
+  {
+    return;
+  }
 
-  if (uv.x < 1280 && uv.y < 720)
-    imageStore(resultImage, uv, vec4(color, 1));
+  vec2 fragCoord = vec2(
+    float(pixel.x) + 0.5,
+    float(size.y - 1 - pixel.y) + 0.5
+  );
+
+  vec4 color;
+  mainImage(color, fragCoord);
+
+  imageStore(outputImage, pixel, color);
 }

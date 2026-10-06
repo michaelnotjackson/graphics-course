@@ -7,6 +7,8 @@
 
 #include "wsi/OsWindowingManager.hpp"
 
+#include <chrono>
+
 
 class App
 {
@@ -28,4 +30,23 @@ private:
 
   std::unique_ptr<etna::Window> vkWindow;
   std::unique_ptr<etna::PerFrameCmdMgr> commandManager;
+
+  etna::ComputePipeline pipeline;
+  etna::Image image;
+
+  void updateInput();
+  void reloadToyShader();
+
+  struct ShaderConstants
+  {
+    float resolutionTime[4]{};
+    float mouse[4]{};
+  };
+
+  static_assert(sizeof(ShaderConstants) == 32);
+
+  ShaderConstants shaderConstants{};
+
+  std::chrono::steady_clock::time_point startTime{};
+  bool reloadWasDown = false;
 };

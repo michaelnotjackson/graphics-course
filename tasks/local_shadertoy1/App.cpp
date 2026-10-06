@@ -1,9 +1,46 @@
 #include "App.hpp"
 
+#include <cstdint>
+#include <vector>
+#include <cstdlib>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+
+#include <etna/DescriptorSet.hpp>
 #include <etna/Etna.hpp>
 #include <etna/GlobalContext.hpp>
 #include <etna/PipelineManager.hpp>
+#include <etna/ShaderProgram.hpp>
 
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+namespace
+{
+
+bool compileToyShader()
+{
+  const std::filesystem::path sourcePath = LOCAL_SHADERTOY1_SOURCE_ROOT "toy.comp";
+  const std::filesystem::path outputPath = LOCAL_SHADERTOY1_SHADERS_ROOT "toy.comp.spv";
+  const std::filesystem::path temporaryPath = outputPath.string() + ".tmp";
+
+  const int result = std::system(
+    ("glslangValidator -V --target-env vulkan1.2 -S comp -o \"" +
+     temporaryPath.string() + "\" \"" + sourcePath.string() + "\"").c_str());
+
+  if (result != 0)
+    return false;
+
+  std::filesystem::copy_file(
+    temporaryPath, outputPath, std::filesystem::copy_options::overwrite_existing);
+
+  std::filesystem::remove(temporaryPath);
+
+  return true;
+}
+
+} // namespace
 
 App::App()
   : resolution{1280, 720}
@@ -28,15 +65,17 @@ App::App()
 
     // Etna does all of the Vulkan initialization heavy lifting.
     // You can skip figuring out how it works for now.
-    etna::initialize(etna::InitParams{
-      .applicationName = "Local Shadertoy",
-      .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
-      .instanceExtensions = instanceExtensions,
-      .deviceExtensions = deviceExtensions,
-      // Replace with an index if etna detects your preferred GPU incorrectly
-      .physicalDeviceIndexOverride = {},
-      .numFramesInFlight = 1,
-    });
+    etna::initialize(
+      etna::InitParams{
+        .applicationName = "Local Shadertoy",
+        .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
+        .instanceExtensions = instanceExtensions,
+        .deviceExtensions = deviceExtensions,
+        // Replace with an index if etna detects your preferred GPU incorrectly
+        .physicalDeviceIndexOverride = {},
+        .numFramesInFlight = 1,
+        .generateBarriersAutomatically = false,
+      });
   }
 
   // Next, we need a magical Etna helper to send commands to the GPU.
@@ -44,9 +83,10 @@ App::App()
   commandManager = etna::get_context().createPerFrameCmdMgr();
 
   // Now we can create an OS window
-  osWindow = windowing.createWindow(OsWindow::CreateInfo{
-    .resolution = resolution,
-  });
+  osWindow = windowing.createWindow(
+    OsWindow::CreateInfo{
+      .resolution = resolution,
+    });
 
   // But we also need to hook the OS window up to Vulkan manually!
   {
@@ -55,18 +95,20 @@ App::App()
     auto surface = osWindow->createVkSurface(etna::get_context().getInstance());
 
     // Then we pass it to Etna to do the complicated work for us
-    vkWindow = etna::get_context().createWindow(etna::Window::CreateInfo{
-      .surface = std::move(surface),
-    });
+    vkWindow = etna::get_context().createWindow(
+      etna::Window::CreateInfo{
+        .surface = std::move(surface),
+      });
 
     // And finally ask Etna to create the actual swapchain so that we can
     // get (different) images each frame to render stuff into.
     // Here, we do not support window resizing, so we only need to call this once.
-    auto [w, h] = vkWindow->recreateSwapchain(etna::Window::DesiredProperties{
-      .resolution = {resolution.x, resolution.y},
-      .vsync = useVsync,
-      .numFramesInFlight = static_cast<uint32_t>(commandManager->getCmdBufferCount()),
-    });
+    auto [w, h] = vkWindow->recreateSwapchain(
+      etna::Window::DesiredProperties{
+        .resolution = {resolution.x, resolution.y},
+        .vsync = useVsync,
+        .numFramesInFlight = static_cast<uint32_t>(commandManager->getCmdBufferCount()),
+      });
 
     // Technically, Vulkan might fail to initialize a swapchain with the requested
     // resolution and pick a different one. This, however, does not occur on platforms
@@ -74,7 +116,24 @@ App::App()
     resolution = {w, h};
   }
 
-  // TODO: Initialize any additional resources you require here!
+  if (!compileToyShader())
+  {
+    throw std::runtime_error("Failed to compile toy.comp");
+  }
+
+  etna::create_program("toy", {LOCAL_SHADERTOY1_SHADERS_ROOT "toy.comp.spv"});
+
+
+  pipeline = etna::get_context().getPipelineManager().createComputePipeline(
+    "toy", etna::ComputePipeline::CreateInfo{});
+
+  image = etna::get_context().createImage(
+    etna::Image::CreateInfo{
+      .extent = vk::Extent3D{resolution.x, resolution.y, 1},
+      .name = "Shadertoy output",
+      .format = vk::Format::eR8G8B8A8Unorm,
+      .imageUsage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+    });
 }
 
 App::~App()
@@ -84,9 +143,14 @@ App::~App()
 
 void App::run()
 {
+  startTime = std::chrono::steady_clock::now();
+
+  glfwSetInputMode(osWindow->native(), GLFW_STICKY_KEYS, GLFW_TRUE);
+
   while (!osWindow->isBeingClosed())
   {
     windowing.poll();
+    updateInput();
 
     drawFrame();
   }
@@ -139,7 +203,84 @@ void App::drawFrame()
       etna::flush_barriers(currentCmdBuf);
 
 
-      // TODO: Record your commands here!
+      const auto program = etna::get_shader_program("toy");
+
+      const auto descriptorSet = etna::create_descriptor_set(
+        program.getDescriptorLayoutId(0),
+        currentCmdBuf,
+        {
+          etna::Binding{
+            0,
+            image.genBinding(vk::Sampler{}, vk::ImageLayout::eGeneral),
+          },
+        });
+
+      etna::set_state(
+        currentCmdBuf,
+        image.get(),
+        vk::PipelineStageFlagBits2::eComputeShader,
+        vk::AccessFlagBits2::eShaderWrite,
+        vk::ImageLayout::eGeneral,
+        vk::ImageAspectFlagBits::eColor);
+
+      etna::flush_barriers(currentCmdBuf);
+
+      currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.getVkPipeline());
+
+      currentCmdBuf.bindDescriptorSets(
+        vk::PipelineBindPoint::eCompute,
+        program.getPipelineLayout(),
+        0,
+        {descriptorSet.getVkSet()},
+        {});
+
+
+      currentCmdBuf.pushConstants(
+        program.getPipelineLayout(),
+        vk::ShaderStageFlagBits::eCompute,
+        0,
+        static_cast<uint32_t>(sizeof(ShaderConstants)),
+        &shaderConstants);
+
+      currentCmdBuf.dispatch((resolution.x + 7u) / 8u, (resolution.y + 7u) / 8u, 1);
+
+      etna::set_state(
+        currentCmdBuf,
+        image.get(),
+        vk::PipelineStageFlagBits2::eTransfer,
+        vk::AccessFlagBits2::eTransferRead,
+        vk::ImageLayout::eTransferSrcOptimal,
+        vk::ImageAspectFlagBits::eColor);
+
+      etna::flush_barriers(currentCmdBuf);
+
+      vk::ImageBlit region{};
+
+      region.srcSubresource = vk::ImageSubresourceLayers{
+        vk::ImageAspectFlagBits::eColor,
+        0,
+        0,
+        1,
+      };
+
+      region.srcOffsets[0] = vk::Offset3D{0, 0, 0};
+      region.srcOffsets[1] = vk::Offset3D{
+        static_cast<int32_t>(resolution.x),
+        static_cast<int32_t>(resolution.y),
+        1,
+      };
+
+      region.dstSubresource = region.srcSubresource;
+      region.dstOffsets[0] = region.srcOffsets[0];
+      region.dstOffsets[1] = region.srcOffsets[1];
+
+      currentCmdBuf.blitImage(
+        image.get(),
+        vk::ImageLayout::eTransferSrcOptimal,
+        backbuffer,
+        vk::ImageLayout::eTransferDstOptimal,
+        {region},
+        vk::Filter::eNearest);
 
 
       // At the end of "rendering", we are required to change how the pixels of the
@@ -181,11 +322,73 @@ void App::drawFrame()
   // After a window us un-minimized, we need to restore the swapchain to continue rendering.
   if (!nextSwapchainImage && osWindow->getResolution() != glm::uvec2{0, 0})
   {
-    auto [w, h] = vkWindow->recreateSwapchain(etna::Window::DesiredProperties{
-      .resolution = {resolution.x, resolution.y},
-      .vsync = useVsync,
-      .numFramesInFlight = static_cast<uint32_t>(commandManager->getCmdBufferCount()),
-    });
+    auto [w, h] = vkWindow->recreateSwapchain(
+      etna::Window::DesiredProperties{
+        .resolution = {resolution.x, resolution.y},
+        .vsync = useVsync,
+        .numFramesInFlight = static_cast<uint32_t>(commandManager->getCmdBufferCount()),
+      });
     ETNA_VERIFY((resolution == glm::uvec2{w, h}));
   }
+}
+
+void App::updateInput()
+{
+  GLFWwindow* window = osWindow->native();
+
+  const bool reloadDown = glfwGetKey(window, GLFW_KEY_F5) == GLFW_PRESS;
+
+  if (reloadDown && !reloadWasDown)
+    reloadToyShader();
+
+  reloadWasDown = reloadDown;
+
+  const auto now = std::chrono::steady_clock::now();
+
+  shaderConstants.resolutionTime[0] = static_cast<float>(resolution.x);
+  shaderConstants.resolutionTime[1] = static_cast<float>(resolution.y);
+  shaderConstants.resolutionTime[2] = 1.0f;
+  shaderConstants.resolutionTime[3] = std::chrono::duration<float>(now - startTime).count();
+
+  int windowWidth = 0;
+  int windowHeight = 0;
+  glfwGetWindowSize(window, &windowWidth, &windowHeight);
+
+  shaderConstants.mouse[2] = 0.0f;
+  shaderConstants.mouse[3] = 0.0f;
+
+  if (windowWidth <= 0 || windowHeight <= 0)
+    return;
+
+  double mouseX = 0.0;
+  double mouseY = 0.0;
+  glfwGetCursorPos(window, &mouseX, &mouseY);
+
+  shaderConstants.mouse[0] =
+    static_cast<float>(mouseX * static_cast<double>(resolution.x) / windowWidth);
+
+  shaderConstants.mouse[1] = static_cast<float>(
+    (static_cast<double>(windowHeight) - mouseY) * static_cast<double>(resolution.y) /
+    windowHeight);
+
+  const bool focused = glfwGetWindowAttrib(window, GLFW_FOCUSED) == GLFW_TRUE;
+
+  const bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+  shaderConstants.mouse[2] = focused && mouseDown ? 1.0f : 0.0f;
+}
+
+void App::reloadToyShader()
+{
+  if (!compileToyShader())
+  {
+    std::cerr << "Shader compilation failed; keeping the old shader.\n";
+    return;
+  }
+
+  ETNA_CHECK_VK_RESULT(etna::get_context().getDevice().waitIdle());
+
+  etna::reload_shaders();
+
+  std::cout << "Shader reloaded.\n";
 }
