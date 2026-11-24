@@ -1,0 +1,38 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D hdrMap;
+layout(std430, binding = 1) readonly buffer Stats {
+  uint minLum;
+  uint maxLum;
+} stats;
+layout(std430, binding = 2) buffer Histogram {
+  uint bins[128];
+} hist;
+
+shared uint sBins[128];
+
+void main() {
+  uint idx = gl_LocalInvocationIndex;
+  if (idx < 128u)
+    sBins[idx] = 0u;
+  barrier();
+
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = textureSize(hdrMap, 0);
+  if (p.x < size.x && p.y < size.y) {
+    vec3 c = texelFetch(hdrMap, p, 0).rgb;
+    float lum = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    float minLog = log2(max(uintBitsToFloat(stats.minLum), 1e-4));
+    float maxLog = log2(max(uintBitsToFloat(stats.maxLum), 1e-4));
+    float range = max(maxLog - minLog, 1e-4);
+    float t = clamp((log2(lum) - minLog) / range, 0.0, 1.0);
+    uint bin = min(uint(t * 128.0), 127u);
+    atomicAdd(sBins[bin], 1u);
+  }
+
+  barrier();
+
+  if (idx < 128u && sBins[idx] > 0u)
+    atomicAdd(hist.bins[idx], sBins[idx]);
+}

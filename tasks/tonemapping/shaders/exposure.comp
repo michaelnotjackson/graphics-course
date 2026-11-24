@@ -1,0 +1,66 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer Stats {
+  uint minLum;
+  uint maxLum;
+} stats;
+layout(std430, binding = 1) readonly buffer Histogram {
+  uint bins[128];
+} hist;
+layout(std430, binding = 2) buffer Exposure {
+  float adaptedLum;
+  float exposure;
+} outExp;
+
+layout(push_constant) uniform Push {
+  float dt;
+  uint pixelCount;
+} pc;
+
+shared uint sCounts[128];
+
+void main() {
+  uint idx = gl_LocalInvocationIndex;
+  sCounts[idx] = hist.bins[idx];
+  barrier();
+
+  if (idx != 0u)
+    return;
+
+  float minLog = log2(max(uintBitsToFloat(stats.minLum), 1e-4));
+  float maxLog = log2(max(uintBitsToFloat(stats.maxLum), 1e-4));
+  float range = maxLog - minLog;
+  float total = max(float(pc.pixelCount), 1.0);
+  float lowCut = total * 0.10;
+  float highCut = total * 0.90;
+
+  float accum = 0.0;
+  float weightedLog = 0.0;
+  float weightSum = 0.0;
+  for (uint i = 0u; i < 128u; ++i) {
+    float c = float(sCounts[i]);
+    float next = accum + c;
+    float lo = max(accum, lowCut);
+    float hi = min(next, highCut);
+    if (hi > lo) {
+      float w = hi - lo;
+      float binLog = minLog + ((float(i) + 0.5) / 128.0) * range;
+      weightedLog += w * binLog;
+      weightSum += w;
+    }
+    accum = next;
+  }
+
+  float targetLog = weightSum > 0.0 ? weightedLog / weightSum : 0.5 * (minLog + maxLog);
+  float targetLum = exp2(targetLog);
+  float prevLum = outExp.adaptedLum;
+  float dt = clamp(pc.dt, 0.0, 0.1);
+  float speed = targetLum > prevLum ? 2.5 : 1.5;
+  float adaptedLum = prevLum <= 0.0
+    ? targetLum
+    : prevLum + (targetLum - prevLum) * (1.0 - exp(-dt * speed));
+
+  outExp.adaptedLum = adaptedLum;
+  outExp.exposure = clamp(0.18 / max(adaptedLum, 1e-4), 0.05, 8.0);
+}

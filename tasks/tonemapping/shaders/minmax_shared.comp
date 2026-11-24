@@ -1,0 +1,43 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D hdrMap;
+layout(std430, binding = 1) buffer Stats {
+  uint minLum;
+  uint maxLum;
+} stats;
+
+shared uint sMin[256];
+shared uint sMax[256];
+
+void main() {
+  uint idx = gl_LocalInvocationIndex;
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 size = textureSize(hdrMap, 0);
+
+  if (p.x < size.x && p.y < size.y) {
+    vec3 c = texelFetch(hdrMap, p, 0).rgb;
+    float lum = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    uint bits = floatBitsToUint(lum);
+    sMin[idx] = bits;
+    sMax[idx] = bits;
+  } else {
+    sMin[idx] = 0x7F7FFFFFu;
+    sMax[idx] = 0u;
+  }
+
+  barrier();
+
+  for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    if (idx < stride) {
+      sMin[idx] = min(sMin[idx], sMin[idx + stride]);
+      sMax[idx] = max(sMax[idx], sMax[idx + stride]);
+    }
+    barrier();
+  }
+
+  if (idx == 0u) {
+    atomicMin(stats.minLum, sMin[0]);
+    atomicMax(stats.maxLum, sMax[0]);
+  }
+}
